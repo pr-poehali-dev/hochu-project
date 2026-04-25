@@ -1,5 +1,6 @@
-"""Загрузка, список, получение, удаление видео"""
-import json, os, base64, uuid, psycopg2, boto3
+"""Видео: список, presigned upload, сохранение, лайки, комментарии, просмотры"""
+import json, os, uuid, psycopg2, boto3
+from botocore.config import Config
 
 CORS = {
     'Access-Control-Allow-Origin': '*',
@@ -13,14 +14,19 @@ def get_conn():
 def get_user_from_session(cur, session_id):
     if not session_id:
         return None
-    cur.execute("SELECT u.id, u.username, u.display_name, u.avatar_url FROM sessions s JOIN users u ON s.user_id=u.id WHERE s.id=%s AND s.expires_at > NOW()", (session_id,))
+    cur.execute(
+        "SELECT u.id, u.username, u.display_name, u.avatar_url FROM sessions s JOIN users u ON s.user_id=u.id WHERE s.id=%s AND s.expires_at > NOW()",
+        (session_id,)
+    )
     return cur.fetchone()
 
 def get_s3():
-    return boto3.client('s3',
+    return boto3.client(
+        's3',
         endpoint_url='https://bucket.poehali.dev',
         aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
-        aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY']
+        aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+        config=Config(signature_version='s3v4')
     )
 
 def handler(event: dict, context) -> dict:
@@ -98,35 +104,50 @@ def handler(event: dict, context) -> dict:
                 'likes': r[14], 'dislikes': r[15]
             }})}
 
-        # UPLOAD video
-        if path.endswith('/upload') and method == 'POST':
+        # PRESIGN — генерируем presigned URL для прямой загрузки в S3
+        if path.endswith('/presign') and method == 'POST':
+            user = get_user_from_session(cur, session_id)
+            if not user:
+                return {'statusCode': 401, 'headers': CORS, 'body': json.dumps({'error': 'Не авторизован'})}
+
+            file_type = body.get('file_type', 'video/mp4')
+            upload_type = body.get('upload_type', 'video')  # 'video' or 'thumbnail'
+            ext = 'jpg' if upload_type == 'thumbnail' else 'mp4'
+            folder = 'thumbnails' if upload_type == 'thumbnail' else 'videos'
+            key = f"{folder}/{uuid.uuid4()}.{ext}"
+
+            s3 = get_s3()
+            presigned_url = s3.generate_presigned_url(
+                'put_object',
+                Params={
+                    'Bucket': 'files',
+                    'Key': key,
+                    'ContentType': file_type,
+                },
+                ExpiresIn=3600
+            )
+            key_id = os.environ['AWS_ACCESS_KEY_ID']
+            cdn_url = f"https://cdn.poehali.dev/projects/{key_id}/files/{key}"
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
+                'presigned_url': presigned_url,
+                'cdn_url': cdn_url,
+                'key': key
+            })}
+
+        # SAVE — сохраняем запись в БД после загрузки в S3
+        if path.endswith('/save') and method == 'POST':
             user = get_user_from_session(cur, session_id)
             if not user:
                 return {'statusCode': 401, 'headers': CORS, 'body': json.dumps({'error': 'Не авторизован'})}
 
             title = (body.get('title') or '').strip()
             description = body.get('description') or ''
-            video_b64 = body.get('video_data')
-            thumb_b64 = body.get('thumbnail_data')
-            duration = body.get('duration') or 0
+            video_url = body.get('video_url') or ''
+            thumbnail_url = body.get('thumbnail_url') or None
+            duration = int(body.get('duration') or 0)
 
-            if not title or not video_b64:
-                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Название и видео обязательны'})}
-
-            s3 = get_s3()
-            key_id = os.environ['AWS_ACCESS_KEY_ID']
-
-            vid_key = f"videos/{uuid.uuid4()}.mp4"
-            video_bytes = base64.b64decode(video_b64)
-            s3.put_object(Bucket='files', Key=vid_key, Body=video_bytes, ContentType='video/mp4')
-            video_url = f"https://cdn.poehali.dev/projects/{key_id}/files/{vid_key}"
-
-            thumbnail_url = None
-            if thumb_b64:
-                thumb_key = f"thumbnails/{uuid.uuid4()}.jpg"
-                thumb_bytes = base64.b64decode(thumb_b64)
-                s3.put_object(Bucket='files', Key=thumb_key, Body=thumb_bytes, ContentType='image/jpeg')
-                thumbnail_url = f"https://cdn.poehali.dev/projects/{key_id}/files/{thumb_key}"
+            if not title or not video_url:
+                return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Название и URL видео обязательны'})}
 
             cur.execute(
                 "INSERT INTO videos (user_id, title, description, video_url, thumbnail_url, duration) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
@@ -134,7 +155,7 @@ def handler(event: dict, context) -> dict:
             )
             video_id = cur.fetchone()[0]
             conn.commit()
-            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'id': video_id, 'video_url': video_url, 'thumbnail_url': thumbnail_url})}
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'id': video_id, 'video_url': video_url})}
 
         # VIEW (count unique views)
         if path.endswith('/view') and method == 'POST':
@@ -160,7 +181,6 @@ def handler(event: dict, context) -> dict:
             if existing:
                 if existing[1] == is_like:
                     cur.execute("UPDATE video_likes SET is_like=NULL WHERE id=%s", (existing[0],))
-                    cur.execute("UPDATE video_likes SET is_like=%s WHERE video_id=%s AND user_id=%s", (None, vid, user[0]))
                     conn.commit()
                     action = 'removed'
                 else:
@@ -178,9 +198,11 @@ def handler(event: dict, context) -> dict:
             cur.execute("SELECT is_like FROM video_likes WHERE video_id=%s AND user_id=%s", (vid, user[0]))
             my_row = cur.fetchone()
             my_reaction = my_row[0] if my_row else None
-            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'action': action, 'likes': likes, 'dislikes': dislikes, 'my_reaction': my_reaction})}
+            return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({
+                'action': action, 'likes': likes, 'dislikes': dislikes, 'my_reaction': my_reaction
+            })}
 
-        # GET LIKES for video
+        # LIKES for video
         if path.endswith('/likes') and method == 'GET':
             vid = params.get('video_id')
             cur.execute("SELECT COUNT(*) FROM video_likes WHERE video_id=%s AND is_like=true", (vid,))
@@ -205,7 +227,8 @@ def handler(event: dict, context) -> dict:
                 WHERE c.video_id=%s ORDER BY c.created_at ASC
             """, (vid,))
             rows = cur.fetchall()
-            comments = [{'id': r[0], 'text': r[1], 'created_at': r[2].isoformat(), 'author': {'id': r[3], 'username': r[4], 'display_name': r[5], 'avatar_url': r[6]}} for r in rows]
+            comments = [{'id': r[0], 'text': r[1], 'created_at': r[2].isoformat(),
+                         'author': {'id': r[3], 'username': r[4], 'display_name': r[5], 'avatar_url': r[6]}} for r in rows]
             return {'statusCode': 200, 'headers': CORS, 'body': json.dumps({'comments': comments})}
 
         # ADD COMMENT

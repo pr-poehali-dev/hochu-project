@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import Icon from "@/components/ui/icon";
-import { api, fileToBase64, timeAgo, formatDuration } from "@/lib/api";
+import { api, uploadToS3, timeAgo, formatDuration } from "@/lib/api";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 interface User { id: number; username: string; email: string; display_name: string; avatar_url?: string; description?: string; donate_qr_url?: string; theme: string; }
@@ -313,26 +313,55 @@ function VideoCard({ video, onClick, idx }: { video: Video; onClick: () => void;
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 function UploadPage({ onUploaded }: { onUploaded: () => void }) {
-  const [title, setTitle] = useState(""); const [description, setDescription] = useState("");
-  const [videoFile, setVideoFile] = useState<File | null>(null); const [thumbFile, setThumbFile] = useState<File | null>(null);
-  const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [progress, setProgress] = useState(0);
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [thumbFile, setThumbFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [progress, setProgress] = useState(0);
+  const [stage, setStage] = useState("");
 
   const submit = async () => {
     if (!title.trim() || !videoFile) { setError("Укажите название и выберите видео"); return; }
-    setLoading(true); setError(""); setProgress(10);
+    setLoading(true); setError(""); setProgress(0);
     try {
-      const videoData = await fileToBase64(videoFile); setProgress(50);
-      let thumbData: string | undefined;
-      if (thumbFile) thumbData = await fileToBase64(thumbFile);
-      setProgress(75);
-      const vid = document.createElement("video"); vid.src = URL.createObjectURL(videoFile);
-      const dur = await new Promise<number>(res => { vid.onloadedmetadata = () => res(Math.floor(vid.duration)); vid.onerror = () => res(0); });
-      const r = await api.videos.upload({ title, description, video_data: videoData, thumbnail_data: thumbData, duration: dur });
-      setProgress(100);
+      // Получаем длительность видео
+      setStage("Анализ видео...");
+      const vidEl = document.createElement("video");
+      vidEl.src = URL.createObjectURL(videoFile);
+      const dur = await new Promise<number>(res => {
+        vidEl.onloadedmetadata = () => res(Math.floor(vidEl.duration));
+        vidEl.onerror = () => res(0);
+        setTimeout(() => res(0), 5000);
+      });
+
+      // Загружаем видео напрямую в S3
+      setStage("Загрузка видео...");
+      const videoUrl = await uploadToS3(videoFile, "video", (pct) => setProgress(Math.round(pct * 0.85)));
+
+      // Загружаем обложку если есть
+      let thumbnailUrl: string | undefined;
+      if (thumbFile) {
+        setStage("Загрузка обложки...");
+        thumbnailUrl = await uploadToS3(thumbFile, "thumbnail", () => {});
+      }
+
+      setProgress(90);
+      setStage("Сохранение...");
+
+      // Сохраняем в БД
+      const r = await api.videos.save({ title, description, video_url: videoUrl, thumbnail_url: thumbnailUrl, duration: dur });
       if (r.error) { setError(r.error); return; }
-      onUploaded();
-    } catch { setError("Ошибка загрузки. Попробуйте файл меньшего размера."); }
-    finally { setLoading(false); setProgress(0); }
+      setProgress(100);
+      setStage("Готово!");
+      setTimeout(() => onUploaded(), 500);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Ошибка загрузки";
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -345,7 +374,9 @@ function UploadPage({ onUploaded }: { onUploaded: () => void }) {
           <span className="text-sm mt-2 font-medium" style={{ color: videoFile ? "hsl(var(--vid-accent))" : "hsl(var(--vid-muted))" }}>
             {videoFile ? videoFile.name : "Нажмите для выбора видео (MP4, WebM, MOV)"}
           </span>
-          <span className="text-xs mt-1" style={{ color: "hsl(var(--vid-muted))" }}>{videoFile ? `${(videoFile.size / 1024 / 1024).toFixed(1)} МБ` : "Видео файл *"}</span>
+          <span className="text-xs mt-1" style={{ color: "hsl(var(--vid-muted))" }}>
+            {videoFile ? `${(videoFile.size / 1024 / 1024).toFixed(1)} МБ` : "Без ограничений по размеру"}
+          </span>
           <input type="file" accept="video/*" className="hidden" onChange={e => setVideoFile(e.target.files?.[0] || null)} />
         </label>
 
@@ -362,12 +393,21 @@ function UploadPage({ onUploaded }: { onUploaded: () => void }) {
           className="w-full px-4 py-3 rounded-xl text-sm outline-none resize-none"
           style={{ background: "hsl(var(--vid-surface-2))", border: "1px solid hsl(var(--vid-border))", color: "hsl(var(--vid-text))" }} />
 
-        {loading && <div><div className="progress-bar"><div className="progress-fill transition-all duration-500" style={{ width: `${progress}%` }} /></div>
-          <p className="text-xs mt-1 text-center" style={{ color: "hsl(var(--vid-muted))" }}>Загрузка... {progress}%</p></div>}
+        {loading && (
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs" style={{ color: "hsl(var(--vid-muted))" }}>{stage}</span>
+              <span className="text-xs font-semibold" style={{ color: "hsl(var(--vid-accent))" }}>{progress}%</span>
+            </div>
+            <div className="progress-bar">
+              <div className="progress-fill transition-all duration-300" style={{ width: `${progress}%` }} />
+            </div>
+          </div>
+        )}
         {error && <p className="text-sm" style={{ color: "hsl(14 100% 57%)" }}>{error}</p>}
         <button onClick={submit} disabled={loading} className="w-full py-3 rounded-xl font-semibold text-sm disabled:opacity-50"
           style={{ background: "hsl(var(--vid-accent))", color: "white" }}>
-          {loading ? "Загружаем..." : "Опубликовать"}
+          {loading ? `${stage || "Загружаем..."}` : "Опубликовать"}
         </button>
       </div>
     </div>
@@ -575,7 +615,12 @@ export default function Index() {
 
   useEffect(() => { loadVideos(); }, [loadVideos]);
 
-  const handleAuth = (u: User, sid: string) => { localStorage.setItem("yuvist_session", sid); setUser(u); };
+  const handleAuth = (u: User, sid: string) => {
+    localStorage.setItem("yuvist_session", sid);
+    setUser(u);
+    setSection("home");
+    loadVideos();
+  };
   const handleLogout = async () => { await api.auth.logout(); localStorage.removeItem("yuvist_session"); setUser(null); setSection("home"); };
   const handleDeleteAccount = async () => { await api.auth.deleteAccount(); localStorage.removeItem("yuvist_session"); setUser(null); setSection("home"); };
 

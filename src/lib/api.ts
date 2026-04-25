@@ -30,7 +30,9 @@ export const api = {
   videos: {
     list: (userId?: number) => req(URLS.videos, `/list${userId ? `?user_id=${userId}` : ""}`, "GET"),
     get: (id: number) => req(URLS.videos, `/get?id=${id}`, "GET"),
-    upload: (data: object) => req(URLS.videos, "/upload", "POST", data),
+    presign: (fileType: string, uploadType: "video" | "thumbnail") =>
+      req(URLS.videos, "/presign", "POST", { file_type: fileType, upload_type: uploadType }),
+    save: (data: object) => req(URLS.videos, "/save", "POST", data),
     view: (videoId: number) => req(URLS.videos, "/view", "POST", { video_id: videoId }),
     like: (videoId: number, isLike: boolean) => req(URLS.videos, "/like", "POST", { video_id: videoId, is_like: isLike }),
     likes: (videoId: number) => req(URLS.videos, `/likes?video_id=${videoId}`, "GET"),
@@ -43,6 +45,35 @@ export const api = {
     update: (data: object) => req(URLS.profile, "/update", "POST", data),
   },
 };
+
+// Прямая загрузка файла в S3 через presigned URL (без лимита размера)
+export async function uploadToS3(
+  file: File,
+  uploadType: "video" | "thumbnail",
+  onProgress?: (pct: number) => void
+): Promise<string> {
+  const fileType = file.type || (uploadType === "video" ? "video/mp4" : "image/jpeg");
+  const presignRes = await api.videos.presign(fileType, uploadType);
+  if (presignRes.error) throw new Error(presignRes.error);
+
+  const { presigned_url, cdn_url } = presignRes;
+
+  await new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", presigned_url);
+    xhr.setRequestHeader("Content-Type", fileType);
+    if (onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+      };
+    }
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`S3 error: ${xhr.status}`)));
+    xhr.onerror = () => reject(new Error("Ошибка сети при загрузке"));
+    xhr.send(file);
+  });
+
+  return cdn_url;
+}
 
 export function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
